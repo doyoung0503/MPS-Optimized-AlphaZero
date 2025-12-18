@@ -76,10 +76,9 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     // 2. Persistent GPU Buffer (increase for larger batches)
     gpu_input_buffer = torch::zeros({512, 14, 8, 8}, torch::kFloat).to(device);
     
-    // 3. Thread Optimization: Testing with 2 workers for incremental race condition testing
-    // Phase 17: Added memory barriers but 4 workers still crash
-    // Testing with 2 workers to find stability sweet spot
-    int num_workers = 2; // Reduced from 4 for incremental stability testing
+    // 3. Thread Optimization: Phase 18 - Testing 4 workers with double-check barriers
+    // Added: release/acquire fences around worker completion, seq_cst before signaling
+    int num_workers = 4; // Testing 4 workers with strengthened synchronization
     
     std::cout << "[MCTS] Spawning " << num_workers << " persistent workers." << std::endl;
     
@@ -306,9 +305,18 @@ void MCTS::worker_loop(int worker_id) {
             std::cerr << "[W" << worker_id << "] Unknown Exception!" << std::endl;
         }
         
-        // Worker Done
-        int active = active_workers.fetch_sub(1);
-        if(active == 1) { // Last one out
+        // Worker Done - CRITICAL SYNCHRONIZATION POINT
+        // 1. Memory fence to ensure all node writes are visible before signaling completion
+        std::atomic_thread_fence(std::memory_order_release);
+        
+        // 2. Decrement active workers count
+        int active = active_workers.fetch_sub(1, std::memory_order_acq_rel);
+        
+        // 3. If last worker, signal main thread
+        if(active == 1) {
+            // Memory fence to ensure main thread sees all updates
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            
             std::unique_lock<std::mutex> lock(work_mutex);
             search_in_progress = false;
             main_cv.notify_one();
@@ -524,6 +532,9 @@ std::vector<std::vector<float>> MCTS::search_async(const std::vector<size_t>& ro
         std::unique_lock<std::mutex> lock(work_mutex);
         main_cv.wait(lock, [&]{ return !search_in_progress; });
     }
+    
+    // CRITICAL: Acquire fence to ensure all worker writes are visible before reading results
+    std::atomic_thread_fence(std::memory_order_acquire);
     
     // std::cout << "[MCTS] Search Finished." << std::endl; // Optional debug
     
