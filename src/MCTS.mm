@@ -76,9 +76,10 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     // 2. Persistent GPU Buffer (increase for larger batches)
     gpu_input_buffer = torch::zeros({512, 14, 8, 8}, torch::kFloat).to(device);
     
-    // 3. Thread Optimization (REDUCED for debugging race conditions)
-    // Using fewer workers to reduce contention and isolate threading issues
-    int num_workers = 4; // Reduced from 12 for stability testing
+    // 3. Thread Optimization: SINGLE WORKER for race condition isolation
+    // Using 1 worker to test if multi-threading is causing non-deterministic crashes
+    // If single-worker succeeds past 11M nodes, race condition is confirmed
+    int num_workers = 1; // CRITICAL: Reduced to 1 for isolation
     
     std::cout << "[MCTS] Spawning " << num_workers << " persistent workers." << std::endl;
     

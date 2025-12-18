@@ -132,6 +132,9 @@ void Trainer::self_play(int num_games, int simulations) {
                 games[i] = mcts.get_node(next_root_idx).state;
                 root_indices[i] = next_root_idx;
                 
+                // MEMORY BARRIER: Ensure root_indices update is visible to all threads
+                std::atomic_thread_fence(std::memory_order_release);
+                
                 // Store History
                 histories[i].push_back({mcts.get_node(root_idx).state, policies[k], mcts.get_node(root_idx).state.turn}); 
             } else {
@@ -150,6 +153,10 @@ void Trainer::self_play(int num_games, int simulations) {
                      }
                  }
                  root_indices[i] = mcts.create_root(games[i]);
+                 
+                 // MEMORY BARRIER: Ensure root_indices update is visible to all threads
+                 std::atomic_thread_fence(std::memory_order_release);
+                 
                  histories[i].push_back({mcts.get_node(root_idx).state, policies[k], mcts.get_node(root_idx).state.turn});
             }
             
