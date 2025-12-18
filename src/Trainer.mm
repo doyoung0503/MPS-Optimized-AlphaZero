@@ -75,17 +75,17 @@ void Trainer::self_play(int num_games, int simulations) {
     int finished_games = 0;
     auto last_print = std::chrono::steady_clock::now();
     
-    // Roots are INDICES now
-    std::vector<int> root_indices;
+    // Roots are INDICES now (64-bit for >2GB arena)
+    std::vector<size_t> root_indices;
     root_indices.reserve(num_games);
     for(auto& g : games) {
         root_indices.push_back(mcts.create_root(g));
     }
     
     while(finished_games < num_games) {
-        // 1. Prepare Active Roots
-        std::vector<int> active_root_indices;
-        std::vector<int> active_game_indices;
+        // 1. Prepare Active Roots (64-bit indices)
+        std::vector<size_t> active_root_indices;
+        std::vector<int> active_game_indices;  // Game indices can stay int
         active_root_indices.reserve(num_games);
         active_game_indices.reserve(num_games);
         
@@ -153,6 +153,19 @@ void Trainer::self_play(int num_games, int simulations) {
             
             
             total_moves++;
+            
+            // === MEMORY CORRUPTION DETECTION ===
+            // If moves_count jumps unexpectedly, stack/heap has been corrupted
+            static int last_total_moves = 0;
+            int delta = total_moves - last_total_moves;
+            if(delta > 1000 || delta < 0) {
+                std::cerr << "[FATAL] Memory corruption detected!" << std::endl;
+                std::cerr << "  total_moves jumped from " << last_total_moves << " to " << total_moves << std::endl;
+                std::cerr << "  delta = " << delta << " (expected 1)" << std::endl;
+                std::cerr << "  Terminating to prevent further corruption." << std::endl;
+                exit(1);
+            }
+            last_total_moves = total_moves;
             
             if(games[i].is_game_over()) {
                 finished[i] = true;

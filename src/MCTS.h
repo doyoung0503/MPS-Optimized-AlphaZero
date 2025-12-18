@@ -10,62 +10,76 @@
 #include <memory>
 #include <cmath>
 
-// Index-based Node (Memory-Safe for Arena Allocator)
-// alignas(64) + padding ensures each node starts on cache line boundary
-struct alignas(64) MCTSNode {
-    Chess state; // ~280 bytes (std::array based, POD-safe)
-    int player; // 4
-    int move_from_parent; // 4
-    
-    // Atomics for Lock-free / Fine-grained locking
-    std::atomic<int> visit_count{0};    // 4 (but aligned to 4)
-    std::atomic<int> virtual_loss{0};   // 4
-    std::atomic<float> value_sum{0.0f}; // 4
-    
-    float prior = 0.0f; // 4
-    
-    // Tree Topology via Indices
-    int32_t parent_index = -1;     // 4
-    int32_t first_child_index = -1; // 4
-    uint16_t num_children = 0;      // 2
-    
-    // 0: Unexpanded, 1: Expanding, 2: Expanded
-    std::atomic<int> expansion_state{0}; // 4
-    
-    bool is_terminal = false;   // 1
-    float terminal_value = 0.0f; // 4
-    
-    // Explicit padding to ensure sizeof(MCTSNode) is exactly 384 bytes (6 * 64)
-    // Current rough size: 280 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 2 + 4 + 1 + 4 = ~323 bytes
-    // Pad to 384 (6 cache lines) for clean alignment
-    char _padding[384 - 280 - 4*7 - 2 - 1 - 4]; // Calculate remaining
+// ============================================================================
+// MCTSNode: Memory-Safe Arena Node with Guaranteed 64-byte Alignment
+// ============================================================================
+// This struct MUST be exactly 384 bytes (6 cache lines) for safe arena indexing.
+// Using explicit padding to ensure ARM64 alignment requirements are met.
 
+struct alignas(64) MCTSNode {
+    // === Block 1: Chess state (largest member first) ===
+    Chess state;  // sizeof(Chess) = 280 bytes
+    
+    // === Block 2: Node metadata (grouped for cache efficiency) ===
+    int player;                         // 4 bytes - offset 280
+    int move_from_parent;               // 4 bytes - offset 284
+    
+    // === Block 3: Atomic counters (naturally aligned) ===
+    std::atomic<int> visit_count{0};    // 4 bytes - offset 288
+    std::atomic<int> virtual_loss{0};   // 4 bytes - offset 292
+    std::atomic<float> value_sum{0.0f}; // 4 bytes - offset 296
+    
+    // === Block 4: Tree topology (64-bit indices for >2GB addressing) ===
+    float prior = 0.0f;                 // 4 bytes - offset 300
+    int64_t parent_index = -1;          // 8 bytes - offset 304 (changed from int32_t)
+    int64_t first_child_index = -1;     // 8 bytes - offset 312 (changed from int32_t)
+    
+    // === Block 5: Expansion state ===
+    std::atomic<int> expansion_state{0}; // 4 bytes - offset 320
+    uint32_t num_children = 0;           // 4 bytes - offset 324 (changed from uint16_t for alignment)
+    bool is_terminal = false;            // 1 byte  - offset 328
+    
+    // === Block 6: Terminal value (4-byte aligned) ===
+    // Padding to align terminal_value to 4-byte boundary
+    char _align_pad1[3] = {0};           // 3 bytes - offset 329 (pad to 332)
+    float terminal_value = 0.0f;        // 4 bytes - offset 332
+    
+    // === Final Padding: Ensure total size is exactly 384 bytes ===
+    // Current offset: 336 bytes. Need: 384 - 336 = 48 bytes padding
+    char _padding[48];
+    
+    // Default constructor (must be trivial for POD-like behavior)
     MCTSNode() = default;
     
-    // Init helper (placement new uses this)
-    void init(const Chess& s, int p, int32_t par, int m, float pri) {
+    // Init helper (called after placement new)
+    // Uses int64_t for parent index to support >2GB arenas
+    void init(const Chess& s, int p, int64_t par, int m, float pri) {
         state = s;
         player = p;
         parent_index = par;
         move_from_parent = m;
         prior = pri;
-        visit_count = 0;
-        virtual_loss = 0;
-        value_sum = 0.0f;
+        visit_count.store(0, std::memory_order_relaxed);
+        virtual_loss.store(0, std::memory_order_relaxed);
+        value_sum.store(0.0f, std::memory_order_relaxed);
         first_child_index = -1;
         num_children = 0;
-        expansion_state = 0;
+        expansion_state.store(0, std::memory_order_relaxed);
         is_terminal = false;
         terminal_value = 0.0f;
     }
 };
 
-// Compile-time verification: MCTSNode must be 64-byte aligned and multiple of 64
-static_assert(sizeof(MCTSNode) % 64 == 0, "MCTSNode size must be multiple of 64 bytes for arena alignment");
-static_assert(alignof(MCTSNode) == 64, "MCTSNode must be 64-byte aligned");
+// ============================================================================
+// Compile-Time Verification: CRITICAL for Arena Safety
+// ============================================================================
+static_assert(sizeof(MCTSNode) == 384, "MCTSNode must be exactly 384 bytes");
+static_assert(sizeof(MCTSNode) % 64 == 0, "MCTSNode must be 64-byte aligned for cache lines");
+static_assert(alignof(MCTSNode) == 64, "MCTSNode alignment must be 64 bytes");
 
+// 64-bit node indices for arenas > 2GB
 struct InferenceRequest {
-    int node_index;
+    size_t node_index;    // Changed from int to size_t
     int game_index; 
 };
 
@@ -75,10 +89,10 @@ public:
     ~MCTS();
 
     void reset_pool(); // Reset arena pointer
-    int create_root(const Chess& state);
-    std::vector<std::vector<float>> search_async(const std::vector<int>& root_indices);
-    int select_action(int root_index, float temp);
-    MCTSNode& get_node(int index);
+    size_t create_root(const Chess& state);  // Returns size_t index
+    std::vector<std::vector<float>> search_async(const std::vector<size_t>& root_indices);  // Takes size_t indices
+    int select_action(size_t root_index, float temp);  // Takes size_t index
+    MCTSNode& get_node(size_t index);  // Takes size_t index
 
 private:
     std::shared_ptr<AlphaZeroNet> model;
@@ -92,7 +106,7 @@ private:
     size_t arena_capacity = 0;
     std::atomic<size_t> allocated_count{0};
     
-    int alloc_nodes(int count);
+    size_t alloc_nodes(size_t count);  // Returns size_t index
     
     // Thread Pool (Persistent)
     std::vector<std::thread> worker_threads;
@@ -112,7 +126,7 @@ private:
     
     // Shared Job State
     bool search_in_progress = false;
-    const std::vector<int>* current_roots = nullptr;
+    const std::vector<size_t>* current_roots = nullptr;  // Changed to size_t
     std::atomic<int>* current_sims_remaining = nullptr;
     std::atomic<int> active_workers{0};
     
@@ -124,6 +138,6 @@ private:
     void inferencer_loop();
     
     // Logic
-    void expand_node(int node_idx, const std::vector<float>& policy, float value);
+    void expand_node(size_t node_idx, const std::vector<float>& policy, float value);  // Changed to size_t
     float ucb(const MCTSNode& node, const MCTSNode& parent) const;
 };

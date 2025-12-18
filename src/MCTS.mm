@@ -34,16 +34,17 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     std::call_once(mirror_flag, init_mirror_table);
     
     // Arena Allocator: Fixed MCTSNode array
-    // M4 Pro 48GB Optimization:
-    // 60M nodes * 384 bytes = 23GB arena (leaves ~25GB for OS + GPU + LibTorch)
-    // sizeof(MCTSNode) is now statically verified as 384 bytes (64-byte aligned)
-    size_t num_nodes = 60000000; 
+    // CONSERVATIVE SIZE: 10M nodes (~4GB) to avoid memory pressure
+    // sizeof(MCTSNode) = 384 bytes (verified at compile time)
+    size_t num_nodes = 10000000; // 10 million nodes
     
     size_t size_bytes = num_nodes * sizeof(MCTSNode);
     int prot = PROT_READ | PROT_WRITE;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     
-    std::cout << "[MCTS] Allocating " << (size_bytes / 1024 / 1024 / 1024) << " GB Arena (" << num_nodes << " nodes, " << sizeof(MCTSNode) << " bytes/node)" << std::endl;
+    std::cout << "[MCTS] sizeof(MCTSNode) = " << sizeof(MCTSNode) << " bytes" << std::endl;
+    std::cout << "[MCTS] sizeof(Chess) = " << sizeof(Chess) << " bytes" << std::endl;
+    std::cout << "[MCTS] Allocating " << (size_bytes / 1024 / 1024) << " MB Arena (" << num_nodes << " nodes)" << std::endl;
     
     node_arena = (MCTSNode*)mmap(NULL, size_bytes, prot, flags, -1, 0);
     if(node_arena == MAP_FAILED) {
@@ -74,12 +75,9 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     // 2. Persistent GPU Buffer (increase for larger batches)
     gpu_input_buffer = torch::zeros({512, 14, 8, 8}, torch::kFloat).to(device);
     
-    // 3. M4 Pro Thread Optimization
-    // M4 Pro has 12 cores (10 P-cores + 2 E-cores)
-    // Use hardware_concurrency, but cap at reasonable limit to avoid MPS contention
-    int hw_concurrency = std::thread::hardware_concurrency();
-    int num_workers = std::min(hw_concurrency, 12); // Cap at 12 for M4 Pro
-    num_workers = std::max(4, num_workers);  // At least 4 workers
+    // 3. Thread Optimization (REDUCED for debugging race conditions)
+    // Using fewer workers to reduce contention and isolate threading issues
+    int num_workers = 4; // Reduced from 12 for stability testing
     
     std::cout << "[MCTS] Spawning " << num_workers << " persistent workers." << std::endl;
     
@@ -115,8 +113,8 @@ void MCTS::reset_pool() {
     allocated_count = 0;
 }
 
-int MCTS::create_root(const Chess& state) {
-    int idx = alloc_nodes(1);
+size_t MCTS::create_root(const Chess& state) {
+    size_t idx = alloc_nodes(1);
     // Placement new to construct atomics properly
     new (&node_arena[idx]) MCTSNode(); 
     node_arena[idx].init(state, state.turn, -1, -1, 0.0f);
@@ -126,7 +124,7 @@ int MCTS::create_root(const Chess& state) {
     return idx;
 }
 
-int MCTS::alloc_nodes(int count) {
+size_t MCTS::alloc_nodes(size_t count) {
     size_t idx = allocated_count.fetch_add(count);
     if(idx + count > arena_capacity) {
         std::cerr << "[CRITICAL] Arena Exhausted! Used " << idx << " of " << arena_capacity << std::endl;
@@ -143,10 +141,10 @@ int MCTS::alloc_nodes(int count) {
                   << " (" << std::fixed << std::setprecision(1) << usage_pct << "%)" << std::endl;
     }
     
-    return (int)idx;
+    return idx;  // Returns size_t, no truncation!
 }
 
-MCTSNode& MCTS::get_node(int index) {
+MCTSNode& MCTS::get_node(size_t index) {
     return node_arena[index];
 }
 
@@ -166,42 +164,42 @@ void MCTS::worker_loop(int worker_id) {
         
         if(stop_signal) return;
         
-        // Job Received
-        const std::vector<int>& roots = *current_roots;
-        int num_games = roots.size();
+        // Job Received (using 64-bit indices)
+        const std::vector<size_t>& roots = *current_roots;
+        size_t num_games = roots.size();
         
         try {
-            for(int game_idx = worker_id; game_idx < num_games; game_idx += stride) {
-                int root_idx = roots[game_idx];
-                if(root_idx < 0 || root_idx >= arena_capacity) continue;
+            for(size_t game_idx = worker_id; game_idx < num_games; game_idx += stride) {
+                size_t root_idx = roots[game_idx];
+                if(root_idx >= arena_capacity) continue;  // size_t is always >= 0
                 
                 std::atomic<int>& remaining = current_sims_remaining[game_idx];
                 
                 while(remaining > 0) {
                     remaining--;
                     
-                    int curr = root_idx;
+                    size_t curr = root_idx;  // 64-bit index
                     // VL: Add to Root immediately (Descent phase)
                     node_arena[curr].virtual_loss++;
                     
-                    std::vector<int> path; 
+                    std::vector<size_t> path;  // 64-bit indices
                     path.reserve(64);
                     path.push_back(curr);
                     
                     int depth = 0;
                     
                     while(true) {
-                        // Safety Bounds
-                        if(curr < 0 || curr >= arena_capacity) break;
+                        // Safety Bounds (64-bit safe)
+                        if(curr >= arena_capacity) break;
                         
                         MCTSNode& node = node_arena[curr];
                         
                         if(node.is_terminal) {
                             float val = node.terminal_value;
                             float curr_val = val; 
-                            // Backup
-                            for(int i=path.size()-1; i>=0; --i) {
-                                int idx = path[i];
+                            // Backup (64-bit safe)
+                            for(size_t i=path.size(); i-->0; ) {
+                                size_t idx = path[i];
                                 MCTSNode& n = node_arena[idx];
                                 
                                 n.visit_count++;
@@ -225,7 +223,7 @@ void MCTS::worker_loop(int worker_id) {
                             
                             {
                                 std::unique_lock<std::mutex> lock(queue_mutex);
-                                inference_queue.push({curr, game_idx});
+                                inference_queue.push({curr, (int)game_idx});  // Cast to int for InferenceRequest
                             }
                             queue_cv.notify_one();
                             
@@ -235,11 +233,11 @@ void MCTS::worker_loop(int worker_id) {
                                 std::this_thread::yield();
                             }
                             
-                            // Backup
+                            // Backup (64-bit safe)
                             float val = node.terminal_value;
                             float curr_val = val; 
-                            for(int i=path.size()-1; i>=0; --i) {
-                                 int idx = path[i];
+                            for(size_t i=path.size(); i-->0; ) {
+                                 size_t idx = path[i];
                                  MCTSNode& n = node_arena[idx];
                                  
                                  n.visit_count++;
@@ -263,15 +261,15 @@ void MCTS::worker_loop(int worker_id) {
                                 }
                             }
                             
-                            // Selection
-                            int best_child = -1;
+                            // Selection (64-bit safe)
+                            size_t best_child = SIZE_MAX;  // Invalid marker
                             float best_score = -1e9;
-                            int start = node.first_child_index;
-                            int end = start + node.num_children;
+                            size_t start = (size_t)node.first_child_index;
+                            size_t end = start + node.num_children;
                             
-                            if(start < 0 || end > arena_capacity) break;
+                            if(node.first_child_index < 0 || end > arena_capacity) break;
                             
-                            for(int c=start; c<end; ++c) {
+                            for(size_t c=start; c<end; ++c) {
                                 float s = ucb(node_arena[c], node);
                                 if(s > best_score) {
                                     best_score = s;
@@ -279,7 +277,7 @@ void MCTS::worker_loop(int worker_id) {
                                 }
                             }
                             
-                            if(best_child != -1) {
+                            if(best_child != SIZE_MAX) {
                                 curr = best_child;
                                 path.push_back(curr);
                                 // VL: Add to chosen child (Descent)
@@ -425,8 +423,8 @@ void MCTS::inferencer_loop() {
     }
 }
 
-void MCTS::expand_node(int node_idx, const std::vector<float>& policy, float value) {
-    if(node_idx < 0 || node_idx >= arena_capacity) return;
+void MCTS::expand_node(size_t node_idx, const std::vector<float>& policy, float value) {
+    if(node_idx >= arena_capacity) return;  // size_t is always >= 0
     MCTSNode& node = node_arena[node_idx];
     
     int winner = node.state.get_winner();
@@ -446,9 +444,9 @@ void MCTS::expand_node(int node_idx, const std::vector<float>& policy, float val
         return;
     }
     
-    int start_idx = alloc_nodes(count);
-    node.first_child_index = start_idx;
-    node.num_children = (uint16_t)count;
+    size_t start_idx = alloc_nodes(count);
+    node.first_child_index = (int64_t)start_idx;
+    node.num_children = (uint32_t)count;
     
     float sum = 0.0f;
     for(const auto& m : moves) {
@@ -456,8 +454,8 @@ void MCTS::expand_node(int node_idx, const std::vector<float>& policy, float val
         if(a < 4352) sum += policy[a];
     }
     
-    // Correct loop
-    for(int i=0; i<count; ++i) {
+    // Correct loop (64-bit safe)
+    for(size_t i=0; i<(size_t)count; ++i) {
         Move m = moves[i];
         int a = m.from*64 + m.to;
          float p = (sum > 0 && a < 4352) ? (policy[a]/sum) : (1.0f/count);
@@ -465,7 +463,7 @@ void MCTS::expand_node(int node_idx, const std::vector<float>& policy, float val
          next.push(m);
          
          new (&node_arena[start_idx+i]) MCTSNode();
-         node_arena[start_idx+i].init(next, -node.player, node_idx, a, p);
+         node_arena[start_idx+i].init(next, -node.player, (int64_t)node_idx, a, p);
     }
     
     node.terminal_value = value;
@@ -485,15 +483,15 @@ float MCTS::ucb(const MCTSNode& node, const MCTSNode& parent) const {
     return q + u;
 }
 
-std::vector<std::vector<float>> MCTS::search_async(const std::vector<int>& root_indices) {
+std::vector<std::vector<float>> MCTS::search_async(const std::vector<size_t>& root_indices) {
     if(allocated_count == 0) {
         // First run or reset. Check arena?
         // Allocator is fine.
     }
     
-    int N = root_indices.size();
+    size_t N = root_indices.size();
     std::vector<std::atomic<int>> sims_remaining(N);
-    for(int i=0; i<N; ++i) sims_remaining[i] = num_simulations;
+    for(size_t i=0; i<N; ++i) sims_remaining[i] = num_simulations;
     
     // Set Job State
     {
@@ -515,21 +513,23 @@ std::vector<std::vector<float>> MCTS::search_async(const std::vector<int>& root_
     
     // std::cout << "[MCTS] Search Finished." << std::endl; // Optional debug
     
-    // Aggregate Results
+    // Aggregate Results (64-bit safe)
     std::vector<std::vector<float>> results;
-    for(int root_idx : root_indices) {
+    for(size_t root_idx : root_indices) {
         MCTSNode& root = node_arena[root_idx];
         std::vector<float> pi(4352, 0.0f);
         float sum = 0.0f;
-        int start = root.first_child_index;
-        int end = start + root.num_children;
-        for(int c=start; c<end; ++c) {
-             MCTSNode& child = node_arena[c];
-             int action = child.move_from_parent;
-             if(action >= 0 && action < 4352) {
-                 pi[action] = (float)child.visit_count;
-                 sum += pi[action];
-             }
+        int64_t start = root.first_child_index;
+        size_t end = (size_t)start + root.num_children;
+        if(start >= 0) {
+            for(size_t c=(size_t)start; c<end; ++c) {
+                 MCTSNode& child = node_arena[c];
+                 int action = child.move_from_parent;
+                 if(action >= 0 && action < 4352) {
+                     pi[action] = (float)child.visit_count;
+                     sum += pi[action];
+                 }
+            }
         }
         if(sum > 0) { for(float& p : pi) p /= sum; }
         results.push_back(pi);
@@ -537,17 +537,19 @@ std::vector<std::vector<float>> MCTS::search_async(const std::vector<int>& root_
     return results;
 }
 
-int MCTS::select_action(int root_idx, float temp) {
+int MCTS::select_action(size_t root_idx, float temp) {
     MCTSNode& root = node_arena[root_idx];
     std::vector<float> pi(4352, 0.0f);
     float sum = 0.0f;
-    int start = root.first_child_index;
-    int end = start + root.num_children;
-    for(int c=start; c<end; ++c) {
-        if(node_arena[c].visit_count > 0) {
-             int a = node_arena[c].move_from_parent;
-             pi[a] = node_arena[c].visit_count;
-             sum += pi[a];
+    int64_t start = root.first_child_index;
+    size_t end = (start >= 0) ? (size_t)start + root.num_children : 0;
+    if(start >= 0) {
+        for(size_t c=(size_t)start; c<end; ++c) {
+            if(node_arena[c].visit_count > 0) {
+                 int a = node_arena[c].move_from_parent;
+                 pi[a] = node_arena[c].visit_count;
+                 sum += pi[a];
+            }
         }
     }
     std::vector<float> probs = pi; 
