@@ -76,10 +76,10 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     // 2. Persistent GPU Buffer (increase for larger batches)
     gpu_input_buffer = torch::zeros({512, 14, 8, 8}, torch::kFloat).to(device);
     
-    // 3. Thread Optimization: SINGLE WORKER for race condition isolation
-    // Using 1 worker to test if multi-threading is causing non-deterministic crashes
-    // If single-worker succeeds past 11M nodes, race condition is confirmed
-    int num_workers = 1; // CRITICAL: Reduced to 1 for isolation
+    // 3. Thread Optimization: Testing with 2 workers for incremental race condition testing
+    // Phase 17: Added memory barriers but 4 workers still crash
+    // Testing with 2 workers to find stability sweet spot
+    int num_workers = 2; // Reduced from 4 for incremental stability testing
     
     std::cout << "[MCTS] Spawning " << num_workers << " persistent workers." << std::endl;
     
@@ -264,12 +264,18 @@ void MCTS::worker_loop(int worker_id) {
                             }
                             
                             // Selection (64-bit safe)
+                            // CRITICAL: Must acquire fence to see all child data after expansion
+                            std::atomic_thread_fence(std::memory_order_acquire);
+                            
                             size_t best_child = SIZE_MAX;  // Invalid marker
                             float best_score = -1e9;
-                            size_t start = (size_t)node.first_child_index;
+                            int64_t child_start = node.first_child_index;
+                            if(child_start < 0) break;  // Not yet set or invalid
+                            
+                            size_t start = (size_t)child_start;
                             size_t end = start + node.num_children;
                             
-                            if(node.first_child_index < 0 || end > arena_capacity) break;
+                            if(end > arena_capacity) break;
                             
                             for(size_t c=start; c<end; ++c) {
                                 float s = ucb(node_arena[c], node);
@@ -469,6 +475,12 @@ void MCTS::expand_node(size_t node_idx, const std::vector<float>& policy, float 
     }
     
     node.terminal_value = value;
+    
+    // CRITICAL MEMORY BARRIER: Ensure all child node writes are visible
+    // Before expansion_state=2. Without this fence, other threads may see
+    // expansion_state=2 but read stale first_child_index or uninitialized children
+    std::atomic_thread_fence(std::memory_order_release);
+    
     node.expansion_state.store(2, std::memory_order_release);
 }
 
