@@ -33,7 +33,7 @@ int main() {
     Trainer trainer(model, device);
     
     int ITERATIONS = 30;  // Extended training
-    int GAMES_PER_ITER = 32; // Reduced from 64 to lower memory pressure
+    int GAMES_PER_ITER = 64; // M4 Pro can handle 64 concurrent games with 60M arena
     int MAX_SIMS = 200;  // Higher simulations
     int TRAIN_BATCHES = 30;  // More batches
     

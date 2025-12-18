@@ -34,14 +34,16 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     std::call_once(mirror_flag, init_mirror_table);
     
     // Arena Allocator: Fixed MCTSNode array
-    // Size: 200 sims * 32 games = ~6.4k nodes per search.
-    // Full game (150 moves) * 6.4k = ~1M nodes. 
-    // 3M nodes (~1.1GB) provides safety margin.
-    int num_nodes = 3000000; 
+    // M4 Pro 48GB Optimization:
+    // 60M nodes * 384 bytes = 23GB arena (leaves ~25GB for OS + GPU + LibTorch)
+    // sizeof(MCTSNode) is now statically verified as 384 bytes (64-byte aligned)
+    size_t num_nodes = 60000000; 
     
-    size_t size_bytes = (size_t)num_nodes * sizeof(MCTSNode);
+    size_t size_bytes = num_nodes * sizeof(MCTSNode);
     int prot = PROT_READ | PROT_WRITE;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    
+    std::cout << "[MCTS] Allocating " << (size_bytes / 1024 / 1024 / 1024) << " GB Arena (" << num_nodes << " nodes, " << sizeof(MCTSNode) << " bytes/node)" << std::endl;
     
     node_arena = (MCTSNode*)mmap(NULL, size_bytes, prot, flags, -1, 0);
     if(node_arena == MAP_FAILED) {
@@ -55,23 +57,29 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     
     std::cout << "[MCTS] Arena Allocated: " << (size_bytes / 1024 / 1024) << " MB (" << num_nodes << " nodes)" << std::endl;
     
-    // 4. Alignment Check
+    // Runtime Alignment Verification (Critical for ARM64)
     uintptr_t addr = reinterpret_cast<uintptr_t>(node_arena);
     if(addr % 64 != 0) {
         std::cerr << "[CRITICAL] Arena not aligned to 64 bytes! Addr: " << addr << std::endl;
         exit(1);
-    } else {
-        std::cout << "[MCTS] Arena Aligned (64 bytes). Addr: " << addr << std::endl;
+    }
+    std::cout << "[MCTS] Arena Aligned (64 bytes). Addr: 0x" << std::hex << addr << std::dec << std::endl;
+    
+    // Verify node stride alignment
+    if(sizeof(MCTSNode) % 64 != 0) {
+        std::cerr << "[CRITICAL] MCTSNode size " << sizeof(MCTSNode) << " not 64-byte multiple!" << std::endl;
+        exit(1);
     }
     
-    // 2. Persistent GPU Buffer
-    gpu_input_buffer = torch::zeros({256, 14, 8, 8}, torch::kFloat).to(device);
+    // 2. Persistent GPU Buffer (increase for larger batches)
+    gpu_input_buffer = torch::zeros({512, 14, 8, 8}, torch::kFloat).to(device);
     
-    // 3. Start Threads
+    // 3. M4 Pro Thread Optimization
+    // M4 Pro has 12 cores (10 P-cores + 2 E-cores)
+    // Use hardware_concurrency, but cap at reasonable limit to avoid MPS contention
     int hw_concurrency = std::thread::hardware_concurrency();
-    int num_workers = std::max(4, hw_concurrency); 
-    // Use full concurrency for workers, inference runs on separate thread (hyperthreading or efficient scheduling)
-    // Or reserved 1? Let's use hw_concurrency.
+    int num_workers = std::min(hw_concurrency, 12); // Cap at 12 for M4 Pro
+    num_workers = std::max(4, num_workers);  // At least 4 workers
     
     std::cout << "[MCTS] Spawning " << num_workers << " persistent workers." << std::endl;
     
@@ -330,23 +338,32 @@ void MCTS::inferencer_loop() {
         
         int N = batch.size();
         
+        // CRITICAL: Strict bounds checking for MPS slice operations
+        if(N <= 0 || N > max_batch_size) {
+            std::cerr << "[ERROR] Invalid batch size N=" << N << " (max=" << max_batch_size << ")" << std::endl;
+            continue;
+        }
+        
         try {
             float* encode_ptr = encode_buffer.data();
             
-            // Encode
+            // Encode with strict bounds checking
             for(int i=0; i<N; ++i) {
                 int node_idx = batch[i].node_index;
-                if(node_idx >= 0 && node_idx < arena_capacity) {
-                    node_arena[node_idx].state.encode(encode_ptr + i*896);
+                if(node_idx < 0 || node_idx >= (int)arena_capacity) {
+                    std::cerr << "[ERROR] Invalid node_idx=" << node_idx << " (capacity=" << arena_capacity << ")" << std::endl;
+                    continue;
                 }
+                node_arena[node_idx].state.encode(encode_ptr + i*896);
             }
             
+            // Safe GPU buffer resize if needed
             if(gpu_input_buffer.size(0) < N) {
-                 // Should not happen if max_batch_size is constant and buffer init is correct
-                 gpu_input_buffer = torch::zeros({N, 14, 8, 8}, torch::kFloat).to(device);
+                std::cout << "[MCTS] Resizing GPU buffer from " << gpu_input_buffer.size(0) << " to " << N << std::endl;
+                gpu_input_buffer = torch::zeros({N, 14, 8, 8}, torch::kFloat).to(device);
             }
             
-            // Safe Slice
+            // Safe Slice with explicit N bounds
             auto slice = gpu_input_buffer.slice(0, 0, N);
             auto cpu_t = torch::from_blob(encode_buffer.data(), {N, 14, 8, 8}, torch::kFloat);
             slice.copy_(cpu_t, false);

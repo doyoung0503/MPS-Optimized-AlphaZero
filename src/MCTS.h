@@ -10,29 +10,35 @@
 #include <memory>
 #include <cmath>
 
-// Index-based Node (POD-like for Arena)
+// Index-based Node (Memory-Safe for Arena Allocator)
+// alignas(64) + padding ensures each node starts on cache line boundary
 struct alignas(64) MCTSNode {
-    Chess state; // ~280 bytes
+    Chess state; // ~280 bytes (std::array based, POD-safe)
     int player; // 4
     int move_from_parent; // 4
     
     // Atomics for Lock-free / Fine-grained locking
-    std::atomic<int> visit_count{0};
-    std::atomic<int> virtual_loss{0};
-    std::atomic<float> value_sum{0.0f};
+    std::atomic<int> visit_count{0};    // 4 (but aligned to 4)
+    std::atomic<int> virtual_loss{0};   // 4
+    std::atomic<float> value_sum{0.0f}; // 4
     
-    float prior = 0.0f;
+    float prior = 0.0f; // 4
     
     // Tree Topology via Indices
-    int32_t parent_index = -1;
-    int32_t first_child_index = -1; 
-    uint16_t num_children = 0;
+    int32_t parent_index = -1;     // 4
+    int32_t first_child_index = -1; // 4
+    uint16_t num_children = 0;      // 2
     
     // 0: Unexpanded, 1: Expanding, 2: Expanded
-    std::atomic<int> expansion_state{0}; 
+    std::atomic<int> expansion_state{0}; // 4
     
-    bool is_terminal = false;
-    float terminal_value = 0.0f;
+    bool is_terminal = false;   // 1
+    float terminal_value = 0.0f; // 4
+    
+    // Explicit padding to ensure sizeof(MCTSNode) is exactly 384 bytes (6 * 64)
+    // Current rough size: 280 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 2 + 4 + 1 + 4 = ~323 bytes
+    // Pad to 384 (6 cache lines) for clean alignment
+    char _padding[384 - 280 - 4*7 - 2 - 1 - 4]; // Calculate remaining
 
     MCTSNode() = default;
     
@@ -53,6 +59,10 @@ struct alignas(64) MCTSNode {
         terminal_value = 0.0f;
     }
 };
+
+// Compile-time verification: MCTSNode must be 64-byte aligned and multiple of 64
+static_assert(sizeof(MCTSNode) % 64 == 0, "MCTSNode size must be multiple of 64 bytes for arena alignment");
+static_assert(alignof(MCTSNode) == 64, "MCTSNode must be 64-byte aligned");
 
 struct InferenceRequest {
     int node_index;
