@@ -1,0 +1,34 @@
+# Build files
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.xcodeproj/
+*.xcworkspace/
+.DS_Store
+
+# Checkpoints and logs
+*.pt
+*.pth
+*.log
+training.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+env/
+venv/
+.env
+
+# Temporary files
+*.tmp
+*.swp
+*~
