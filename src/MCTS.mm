@@ -34,9 +34,10 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     std::call_once(mirror_flag, init_mirror_table);
     
     // Arena Allocator: Fixed MCTSNode array
-    // CONSERVATIVE SIZE: 10M nodes (~4GB) to avoid memory pressure
+    // M4 Pro 48GB Optimization: 60M nodes * 384 bytes = 23GB arena
     // sizeof(MCTSNode) = 384 bytes (verified at compile time)
-    size_t num_nodes = 10000000; // 10 million nodes
+    // All indices are now 64-bit (size_t) to prevent 2GB overflow
+    size_t num_nodes = 60000000; // 60 million nodes for full 48GB utilization
     
     size_t size_bytes = num_nodes * sizeof(MCTSNode);
     int prot = PROT_READ | PROT_WRITE;
@@ -334,7 +335,7 @@ void MCTS::inferencer_loop() {
         
         if(batch.empty()) continue;
         
-        int N = batch.size();
+        size_t N = batch.size();  // 64-bit batch size
         
         // CRITICAL: Strict bounds checking for MPS slice operations
         if(N <= 0 || N > max_batch_size) {
@@ -345,10 +346,10 @@ void MCTS::inferencer_loop() {
         try {
             float* encode_ptr = encode_buffer.data();
             
-            // Encode with strict bounds checking
-            for(int i=0; i<N; ++i) {
-                int node_idx = batch[i].node_index;
-                if(node_idx < 0 || node_idx >= (int)arena_capacity) {
+            // Encode with strict bounds checking (64-bit safe)
+            for(size_t i=0; i<N; ++i) {
+                size_t node_idx = batch[i].node_index;  // CRITICAL: 64-bit!
+                if(node_idx >= arena_capacity) {
                     std::cerr << "[ERROR] Invalid node_idx=" << node_idx << " (capacity=" << arena_capacity << ")" << std::endl;
                     continue;
                 }
@@ -356,14 +357,14 @@ void MCTS::inferencer_loop() {
             }
             
             // Safe GPU buffer resize if needed
-            if(gpu_input_buffer.size(0) < N) {
+            if(gpu_input_buffer.size(0) < (int64_t)N) {
                 std::cout << "[MCTS] Resizing GPU buffer from " << gpu_input_buffer.size(0) << " to " << N << std::endl;
-                gpu_input_buffer = torch::zeros({N, 14, 8, 8}, torch::kFloat).to(device);
+                gpu_input_buffer = torch::zeros({static_cast<long long>(N), 14, 8, 8}, torch::kFloat).to(device);
             }
             
             // Safe Slice with explicit N bounds
-            auto slice = gpu_input_buffer.slice(0, 0, N);
-            auto cpu_t = torch::from_blob(encode_buffer.data(), {N, 14, 8, 8}, torch::kFloat);
+            auto slice = gpu_input_buffer.slice(0, 0, static_cast<int64_t>(N));
+            auto cpu_t = torch::from_blob(encode_buffer.data(), {static_cast<long long>(N), 14, 8, 8}, torch::kFloat);
             slice.copy_(cpu_t, false);
             
             // Inference with detailed error handling
@@ -387,9 +388,9 @@ void MCTS::inferencer_loop() {
             float* p_ptr = p_tens.data_ptr<float>();
             float* v_ptr = v_tens.data_ptr<float>();
             
-            // Expand
-            for(int i=0; i<N; ++i) {
-                int node_idx = batch[i].node_index;
+            // Expand (64-bit safe)
+            for(size_t i=0; i<N; ++i) {
+                size_t node_idx = batch[i].node_index;  // CRITICAL: 64-bit!
                 std::vector<float> policy(p_ptr + i*4352, p_ptr + (i+1)*4352);
                 float val = v_ptr[i];
                 
@@ -398,7 +399,7 @@ void MCTS::inferencer_loop() {
                 // If turn is Black, we flip policy?
                 // MCTSNode state is raw?
                 // Helper check:
-                if(node_idx >= 0 && node_idx < arena_capacity) {
+                if(node_idx < arena_capacity) {
                     if(node_arena[node_idx].state.turn == BLACK) { 
                          std::vector<float> flipped(4352, 0.0f);
                          for(int a=0; a<4352; ++a) {
@@ -413,8 +414,8 @@ void MCTS::inferencer_loop() {
              std::cerr << "[Inferencer] Exception: " << e.what() << std::endl;
              // Unblock waiting workers to avoid deadlock
              for(auto& req : batch) {
-                 int idx = req.node_index;
-                 if(idx >= 0 && idx < arena_capacity) {
+                 size_t idx = req.node_index;  // 64-bit!
+                 if(idx < arena_capacity) {
                      // Force expand to dummy to unblock
                      node_arena[idx].expansion_state.store(2, std::memory_order_release);
                  }
