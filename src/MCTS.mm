@@ -34,12 +34,12 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     std::call_once(mirror_flag, init_mirror_table);
     
     // Arena Allocator: Fixed MCTSNode array
-    // M4 Pro 48GB Optimization: 60M nodes * 384 bytes = 23GB arena
+    // M4 Pro 48GB Optimization: 80M nodes * 384 bytes = 30GB arena
     // sizeof(MCTSNode) = 384 bytes (verified at compile time)
-    // All indices are now 64-bit (size_t) to prevent 2GB overflow
-    size_t num_nodes = 60000000; // 60 million nodes for full 48GB utilization
+    // All indices are now 64-bit (size_t) to prevent 2GB/4GB overflow
+    size_t num_nodes = 80000000; // 80 million nodes (~30GB) for M4 Pro 48GB
     
-    size_t size_bytes = num_nodes * sizeof(MCTSNode);
+    size_t size_bytes = static_cast<size_t>(num_nodes) * static_cast<size_t>(sizeof(MCTSNode));
     int prot = PROT_READ | PROT_WRITE;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     
@@ -76,9 +76,9 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     // 2. Persistent GPU Buffer (increase for larger batches)
     gpu_input_buffer = torch::zeros({512, 14, 8, 8}, torch::kFloat).to(device);
     
-    // 3. Thread Optimization: Phase 18 - Testing 4 workers with double-check barriers
-    // Added: release/acquire fences around worker completion, seq_cst before signaling
-    int num_workers = 4; // Testing 4 workers with strengthened synchronization
+    // 3. Thread Optimization: Phase 19 - Testing 8 workers with full barriers
+    // M4 Pro has 10 performance cores, using 8 for optimal utilization
+    int num_workers = 8; // Full M4 Pro P-core utilization
     
     std::cout << "[MCTS] Spawning " << num_workers << " persistent workers." << std::endl;
     
@@ -493,15 +493,25 @@ void MCTS::expand_node(size_t node_idx, const std::vector<float>& policy, float 
 }
 
 float MCTS::ucb(const MCTSNode& node, const MCTSNode& parent) const {
-    int total = node.visit_count + node.virtual_loss;
+    // CRITICAL ACQUIRE FENCE: Ensure we read consistent atomic values
+    // Without this, we may see partial updates during backup
+    std::atomic_thread_fence(std::memory_order_acquire);
+    
+    // Read atomics with explicit acquire ordering for consistency
+    int vc = node.visit_count.load(std::memory_order_acquire);
+    int vl = node.virtual_loss.load(std::memory_order_acquire);
+    float vs = node.value_sum.load(std::memory_order_acquire);
+    int parent_vc = parent.visit_count.load(std::memory_order_acquire);
+    
+    int total = vc + vl;
     float node_val = 0.0f;
     if(total > 0) {
-        node_val = (node.value_sum - node.virtual_loss) / total;
+        node_val = (vs - vl) / total;
     } else {
         node_val = -0.2f;
     }
     float q = -node_val;
-    float u = c_puct * node.prior * std::sqrt((float)parent.visit_count) / (1.0f + total);
+    float u = c_puct * node.prior * std::sqrt((float)parent_vc) / (1.0f + total);
     return q + u;
 }
 
