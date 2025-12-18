@@ -76,9 +76,14 @@ MCTS::MCTS(std::shared_ptr<AlphaZeroNet> net, int sims, float cpuct, int batch_s
     // 2. Persistent GPU Buffer (increase for larger batches)
     gpu_input_buffer = torch::zeros({512, 14, 8, 8}, torch::kFloat).to(device);
     
-    // 3. Thread Optimization: Phase 19 - Testing 8 workers with full barriers
-    // M4 Pro has 10 performance cores, using 8 for optimal utilization
-    int num_workers = 8; // Full M4 Pro P-core utilization
+    // =========================================================================
+    // PRODUCTION CONFIGURATION (Phase 20)
+    // =========================================================================
+    // M4 Pro 48GB optimal settings after extensive Phase 16-19 testing:
+    // - 4 workers: Proven stable for 23+ min, 12.5% arena (7.5M nodes)
+    // - 8 workers: Faster (608 vs 284 moves/min) but less stable
+    // - Recommendation: Use 4 workers for long training, 6-8 for benchmarks
+    int num_workers = 4; // PRODUCTION: Conservative for unattended training
     
     std::cout << "[MCTS] Spawning " << num_workers << " persistent workers." << std::endl;
     
@@ -393,10 +398,15 @@ void MCTS::inferencer_loop() {
                 v_tens = std::get<1>(out).cpu();
             } catch(const c10::Error& e) {
                 std::cerr << "[FATAL] LibTorch error in inference #" << inference_count << ": " << e.what() << std::endl;
-                std::cerr << "[FATAL] Batch size was: " << N << std::endl;
+                std::cerr << "[FATAL] Batch size: " << N << ", Arena: " << allocated_count.load() << "/" << arena_capacity << std::endl;
+                fflush(stderr);
+                torch::mps::synchronize();
                 exit(1);
             } catch(const std::exception& e) {
                 std::cerr << "[FATAL] Std exception in inference #" << inference_count << ": " << e.what() << std::endl;
+                std::cerr << "[FATAL] Batch size: " << N << ", Arena: " << allocated_count.load() << "/" << arena_capacity << std::endl;
+                fflush(stderr);
+                torch::mps::synchronize();
                 exit(1);
             }
             
