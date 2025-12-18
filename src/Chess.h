@@ -39,6 +39,11 @@ public:
     
     // Fullmove number
     int fullmoves;
+    
+    // Explicit padding for 8-byte alignment on ARM64
+    // Current size: 64*4 + 4 + 4 + 4 + 4 + 4 = 276 bytes
+    // Add 4 bytes to reach 280 (divisible by 8)
+    char _padding[4] = {0};
 
     Chess();
     
